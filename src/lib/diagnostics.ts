@@ -6,7 +6,6 @@
 export async function checkLatency(): Promise<number | null> {
   const start = Date.now();
   try {
-    // Using a common endpoint for connectivity checks
     await fetch('https://www.google.com/generate_204', { mode: 'no-cors', cache: 'no-cache' });
     return Date.now() - start;
   } catch (e) {
@@ -17,7 +16,6 @@ export async function checkLatency(): Promise<number | null> {
 
 export async function checkDNS(): Promise<boolean> {
   try {
-    // Attempt to fetch a known domain
     const response = await fetch('https://dns.google/resolve?name=google.com', { mode: 'cors' });
     return response.ok;
   } catch (e) {
@@ -37,6 +35,10 @@ export function getChromebookInfo() {
     connection: (navigator as any).connection?.effectiveType || 'unknown'
   };
 }
+
+// ---------------------------------------------------------------------------
+// Crosh parser
+// ---------------------------------------------------------------------------
 
 export interface ParsedService {
   name: string;
@@ -67,11 +69,9 @@ export function parseCroshOutput(text: string): ParsedService | null {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    
-    // Look for service headers (e.g., "/service/2" or "Service: /service/2")
+
     const serviceMatch = trimmed.match(/^(?:Service:?\s*)?(\/service\/\d+):?$/i);
     if (serviceMatch) {
-      // If the previous service we were tracking was active, we've found our winner
       if (currentService?.state === 'online' || currentService?.state === 'ready' || currentService?.isConnected) {
         activeService = currentService;
         break;
@@ -82,38 +82,32 @@ export function parseCroshOutput(text: string): ParsedService | null {
 
     if (!currentService) continue;
 
-    // Improved KV matching to allow slashes and dots in keys
     const kvMatch = trimmed.match(/^([\w./]+)\s*[=:]\s*(.*)$/);
     if (kvMatch) {
       const key = kvMatch[1].toLowerCase();
       const value = kvMatch[2].trim();
 
-      // STRICT matching for state to avoid RoamState overwriting
       if (key === 'state') currentService.state = value.toLowerCase();
       if (key === 'isconnected' && value.toLowerCase() === 'true') currentService.isConnected = true;
       if (key === 'type') currentService.type = value;
       if (key === 'security') currentService.security = value;
       if (key === 'strength') currentService.strength = value;
       if (key === 'name' || key === 'logname') currentService.name = value;
-      
-      // Signal Metrics (Support both RSSI and Signal formats)
+
       if (key === 'wifi.lastreceivesignal' || key === 'wifi.signalstrengthrssi') {
         currentService.lastSignal = value;
       }
       if (key === 'wifi.averagereceivesignal') {
         currentService.avgSignal = value;
       }
-      
-      // Packet Metrics
+
       if (key === 'wifi.transmitfailures') currentService.txFailures = value;
       if (key === 'wifi.transmitsuccesses') currentService.txSuccesses = value;
 
-      // IP Address (Look for common IPv4 patterns)
       if (key.includes('ipv4address') && !currentService.ip) {
         currentService.ip = value.split('/')[0];
       }
 
-      // EAP / Security
       if (key === 'eap.method') {
         if (!currentService.eap) currentService.eap = {};
         currentService.eap.method = value;
@@ -129,13 +123,288 @@ export function parseCroshOutput(text: string): ParsedService | null {
     }
   }
 
-  // Final check for the last service in the loop
   if (!activeService && (currentService?.state === 'online' || currentService?.state === 'ready' || currentService?.isConnected)) {
     activeService = currentService;
   }
 
   return activeService as ParsedService;
 }
+
+// ---------------------------------------------------------------------------
+// chrome://system parser — Step 6: robust QP + HTML decoding
+// ---------------------------------------------------------------------------
+
+function decodeQP(text: string): string {
+  return text
+    .replace(/=\r?\n/g, '')  // soft line breaks
+    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+}
+
+function stripTags(text: string): string {
+  return text.replace(/<!--[\s\S]*?-->/g, '').replace(/<[^>]+>/g, '');
+}
+
+/**
+ * Extracts named sections from a plain-text copy-paste of chrome://system.
+ * When a user selects-all and copies in Chrome, each section appears as:
+ *   🔗 section_name      ← link icon (U+1F517) + name on its own line
+ *   Collapse…            ← button text to skip
+ *   <content lines>
+ */
+function extractPlainTextSections(text: string): Record<string, string> {
+  const sections: Record<string, string> = {};
+
+  // Strip the 🔗 link-chain emoji Chrome prepends to section names
+  const cleaned = text.replace(/\u{1F517}\s*/gu, '');
+
+  // All section names we care about for Wi-Fi diagnostics
+  const TARGET = new Set([
+    'lspci', 'lsusb', 'lsusb_verbose',
+    'network_devices', 'network_services', 'network_event_log', 'ifconfig',
+    'meminfo', 'cpuinfo', 'dmesg',
+    'CHROMEOS_RELEASE_VERSION', 'CHROMEOS_RELEASE_BOARD',
+    'CHROMEOS_RELEASE_TRACK', 'CHROMEOS_RELEASE_CHROME_MILESTONE',
+    'CHROMEOS_RELEASE_BUILDER_PATH', 'CHROMEOS_FIRMWARE_VERSION',
+    'CHROME VERSION', 'fw_version',
+  ]);
+
+  const lines = cleaned.split('\n');
+  let current: string | null = null;
+  let buffer: string[] = [];
+
+  const flush = () => {
+    if (current && buffer.length > 0) sections[current] = buffer.join('\n').trim();
+    buffer = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Skip Chrome's "Collapse…" / "Expand…" button text (U+2026 ellipsis or plain dots)
+    if (/^(Collapse|Expand)[….]/.test(trimmed)) continue;
+
+    if (TARGET.has(trimmed)) {
+      flush();
+      current = trimmed;
+    } else if (current) {
+      buffer.push(trimmed);
+    }
+  }
+  flush();
+  return sections;
+}
+
+/**
+ * Extracts named sections from chrome://system HTML output (including
+ * quoted-printable encoded page source saved from a network capture).
+ * Returns a map of section_name -> plain text content.
+ */
+function extractHtmlSections(raw: string): Record<string, string> {
+  const decoded = decodeEntities(decodeQP(raw));
+  const sections: Record<string, string> = {};
+  const nameRe = /name="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = nameRe.exec(decoded)) !== null) {
+    const sectionName = m[1];
+    const tail = decoded.slice(m.index + m[0].length);
+    const marker = 'class="stat-value">';
+    const si = tail.indexOf(marker);
+    if (si === -1) continue;
+    const ci = si + marker.length;
+    const ei = tail.indexOf('</span>', ci);
+    if (ei === -1) continue;
+    sections[sectionName] = stripTags(tail.slice(ci, ei)).trim();
+  }
+
+  return sections;
+}
+
+// ---------------------------------------------------------------------------
+// Network device + service interfaces and parsers (Steps 2 & 3)
+// ---------------------------------------------------------------------------
+
+export interface NetworkDeviceInfo {
+  macAddress?: string;
+  interface?: string;
+  ipv4Address?: string;
+  ipv4Gateway?: string;
+  nameServers?: string[];
+  linkStats?: {
+    avgSignalDbm?: number;
+    lastSignalDbm?: number;
+    receiveBitrate?: string;
+    transmitBitrate?: string;
+    transmitRetries?: number;
+    packetRx?: number;
+    packetTx?: number;
+  };
+  wakeOnWiFiAllowed?: boolean;
+  wakeOnWiFiSupported?: boolean;
+  macRandomizationEnabled?: boolean;
+  bgscanSignalThreshold?: number;
+}
+
+export interface NetworkServiceInfo {
+  ssid?: string;
+  bssid?: string;
+  security?: string;
+  state?: string;
+  strength?: number;
+  signalRssi?: number;
+  frequency?: number;
+  frequencyList?: number[];
+  phyMode?: number;
+  band?: string;
+  channel?: number;
+  downlinkMbps?: number;
+  uplinkMbps?: number;
+  ipv4Address?: string;
+  ipv4Gateway?: string;
+  nameServers?: string[];
+  disconnectCount?: number;
+  misconnectCount?: number;
+  error?: string;
+  country?: string;
+  keyMgmt?: string;
+  roamState?: string;
+  isConnected?: boolean;
+  eap?: { method?: string; identity?: string };
+}
+
+export const PHY_MODE_LABELS: Record<number, string> = {
+  1: '802.11a', 2: '802.11b', 3: '802.11g',
+  4: 'Wi-Fi 4 (802.11n)', 5: 'Wi-Fi 5 (802.11ac)',
+  6: 'Wi-Fi 6 (802.11ax)', 7: 'Wi-Fi 6E / Wi-Fi 7',
+};
+
+function freqToBand(freq: number): string {
+  if (freq < 3000) return '2.4 GHz';
+  if (freq < 5925) return '5 GHz';
+  return '6 GHz';
+}
+
+function freqToChannel(freq: number): number {
+  if (freq >= 2412 && freq <= 2472) return Math.round((freq - 2412) / 5) + 1;
+  if (freq === 2484) return 14;
+  if (freq >= 5000) return Math.round((freq - 5000) / 5);
+  return 0;
+}
+
+function parseNetworkDeviceJson(json: string): NetworkDeviceInfo | null {
+  try {
+    const data = JSON.parse(json);
+    const key = Object.keys(data).find(k => k.includes('wlan'));
+    if (!key) return null;
+    const d = data[key];
+    const configs = Object.values((d.IPConfigs || {}) as Record<string, any>);
+    const v4 = configs.find((c: any) => c.Method === 'dhcp') as any;
+    const ls = d.LinkStatistics || {};
+    return {
+      macAddress: d.Address,
+      interface: d.Interface || d.Name,
+      ipv4Address: v4?.Address,
+      ipv4Gateway: v4?.Gateway,
+      nameServers: v4?.NameServers,
+      linkStats: {
+        avgSignalDbm: ls.AverageReceiveSignalDbm,
+        lastSignalDbm: ls.LastReceiveSignalDbm,
+        receiveBitrate: ls.ReceiveBitrate,
+        transmitBitrate: ls.TransmitBitrate,
+        transmitRetries: ls.TransmitRetries != null ? Math.round(ls.TransmitRetries) : undefined,
+        packetRx: ls.PacketReceiveSuccesses != null ? Math.round(ls.PacketReceiveSuccesses) : undefined,
+        packetTx: ls.PacketTransmitSuccesses != null ? Math.round(ls.PacketTransmitSuccesses) : undefined,
+      },
+      wakeOnWiFiAllowed: d.WakeOnWiFiAllowed,
+      wakeOnWiFiSupported: d.WakeOnWiFiSupported,
+      macRandomizationEnabled: d.MACAddressRandomizationEnabled,
+      bgscanSignalThreshold: d.BgscanSignalThreshold,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseNetworkServiceJson(json: string): NetworkServiceInfo | null {
+  try {
+    const data = JSON.parse(json);
+    const key = Object.keys(data).find(k => {
+      const s = data[k];
+      return s.IsConnected === true || s.State === 'online' || s.State === 'ready';
+    });
+    if (!key) return null;
+    const s = data[key];
+    const nc = s.NetworkConfig || {};
+    const freq: number | undefined = s['WiFi.Frequency'];
+    return {
+      ssid: s.Name,
+      bssid: s['WiFi.BSSID'],
+      security: s.Security,
+      state: s.State,
+      strength: s.Strength,
+      signalRssi: s['WiFi.SignalStrengthRssi'],
+      frequency: freq,
+      frequencyList: s['WiFi.FrequencyList'],
+      phyMode: s['WiFi.PhyMode'],
+      band: freq ? freqToBand(freq) : undefined,
+      channel: freq ? freqToChannel(freq) : undefined,
+      downlinkMbps: s.DownlinkSpeedKbps ? Math.round(s.DownlinkSpeedKbps / 100) / 10 : undefined,
+      uplinkMbps: s.UplinkSpeedKbps ? Math.round(s.UplinkSpeedKbps / 100) / 10 : undefined,
+      ipv4Address: nc.IPv4Address?.split('/')[0],
+      ipv4Gateway: nc.IPv4Gateway,
+      nameServers: nc.NameServers,
+      disconnectCount: s['Diagnostics.Disconnects']?.length ?? 0,
+      misconnectCount: s['Diagnostics.Misconnects']?.length ?? 0,
+      error: s.Error !== 'no-failure' ? s.Error : undefined,
+      country: s.Country,
+      keyMgmt: s['EAP.KeyMgmt'],
+      roamState: s['WiFi.RoamState'],
+      isConnected: s.IsConnected,
+      eap: s['EAP.EAP'] ? { method: s['EAP.EAP'], identity: s['EAP.Identity'] } : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Converts rich system-parsed network data into a ParsedService so the main
+ * dashboard can be populated from a chrome://system paste (no crosh needed).
+ */
+export function networkServiceToParsedService(
+  ns: NetworkServiceInfo,
+  nd?: NetworkDeviceInfo
+): ParsedService {
+  return {
+    name: ns.ssid || 'Unknown',
+    type: 'wifi',
+    state: ns.state || 'unknown',
+    security: ns.security || 'unknown',
+    strength: String(ns.strength ?? 0),
+    lastSignal: nd?.linkStats?.lastSignalDbm != null
+      ? String(nd.linkStats.lastSignalDbm)
+      : ns.signalRssi != null ? String(ns.signalRssi) : undefined,
+    avgSignal: nd?.linkStats?.avgSignalDbm != null
+      ? String(nd.linkStats.avgSignalDbm) : undefined,
+    txFailures: nd?.linkStats?.transmitRetries != null
+      ? String(nd.linkStats.transmitRetries) : undefined,
+    txSuccesses: nd?.linkStats?.packetTx != null
+      ? String(nd.linkStats.packetTx) : undefined,
+    ip: ns.ipv4Address || nd?.ipv4Address,
+    eap: ns.eap ? { method: ns.eap.method, identity: ns.eap.identity } : undefined,
+    psk: ns.keyMgmt ? { key_mgmt: ns.keyMgmt } : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SystemInfo interface + parseSystemInfo
+// ---------------------------------------------------------------------------
 
 export interface SystemInfo {
   lspci?: string[];
@@ -145,56 +414,83 @@ export interface SystemInfo {
   version?: string;
   os_version?: string;
   firmware_version?: string;
+  // New fields
+  wifiChipset?: string;
+  board?: string;
+  channel?: string;
+  milestone?: string;
+  networkDevice?: NetworkDeviceInfo;
+  networkService?: NetworkServiceInfo;
 }
 
 export function parseSystemInfo(text: string): SystemInfo {
   const info: SystemInfo = {};
-  const lines = text.split('\n');
-  
-  let currentKey: keyof SystemInfo | null = null;
-  let buffer: string[] = [];
 
-  const flushBuffer = () => {
-    if (currentKey && buffer.length > 0) {
-      if (currentKey === 'lspci' || currentKey === 'lsusb') {
-        info[currentKey] = [...buffer];
-      } else {
-        info[currentKey] = buffer.join('\n').trim();
-      }
-    }
-    buffer = [];
-  };
+  // 1. Try HTML extraction (QP-encoded page source / network capture)
+  const htmlSections = extractHtmlSections(text);
+  // 2. Try plain-text extraction (Ctrl+A, Ctrl+C from Chrome's chrome://system)
+  const plainSections = Object.keys(htmlSections).length === 0
+    ? extractPlainTextSections(text)
+    : {};
 
-  for (const line of lines) {
-    // chrome://system format is usually "KeyName   Value" or "KeyName [Expand]"
-    // We look for known keys at the start of the line
-    const lowerLine = line.toLowerCase();
-    
-    let foundKey: keyof SystemInfo | null = null;
-    if (line.startsWith('lspci')) foundKey = 'lspci';
-    else if (line.startsWith('lsusb')) foundKey = 'lsusb';
-    else if (line.startsWith('cpuinfo')) foundKey = 'cpuinfo';
-    else if (line.startsWith('meminfo')) foundKey = 'meminfo';
-    else if (line.startsWith('CHROME VERSION')) foundKey = 'version';
-    else if (line.startsWith('CHROMEOS_RELEASE_VERSION')) foundKey = 'os_version';
-    else if (line.startsWith('fw_version')) foundKey = 'firmware_version';
+  const sections = Object.keys(htmlSections).length > 0 ? htmlSections : plainSections;
 
-    if (foundKey) {
-      flushBuffer();
-      currentKey = foundKey;
-      // Try to get value from the same line if it's there
-      const valuePart = line.substring(line.indexOf(' ') + 1).trim();
-      if (valuePart && valuePart !== '[Expand]') {
-        buffer.push(valuePart);
-      }
-    } else if (currentKey) {
-      // If we are in a section, and the line doesn't look like a new key (starts with whitespace or is a continuation)
-      // chrome://system often indents multi-line values or they just follow
-      if (line.trim() === '') continue;
-      buffer.push(line.trim());
+  // Populate fields from whichever extractor found sections
+  if (sections.lspci) {
+    info.lspci = sections.lspci.split('\n').map(l => l.trim()).filter(Boolean);
+  }
+  if (sections.lsusb) {
+    info.lsusb = sections.lsusb.split('\n').map(l => l.trim()).filter(Boolean);
+  }
+  if (sections.meminfo) {
+    info.meminfo = sections.meminfo;
+  }
+  if (sections.network_devices) {
+    info.networkDevice = parseNetworkDeviceJson(sections.network_devices) ?? undefined;
+  }
+  if (sections.network_services) {
+    info.networkService = parseNetworkServiceJson(sections.network_services) ?? undefined;
+  }
+
+  // CHROMEOS_RELEASE_* — plain-text format has these as individual sections
+  // whose content is just the bare value (e.g. "16581.42.0").
+  // QP/HTML format has them as key=value pairs in the raw text (handled by regex below).
+  if (sections.CHROMEOS_RELEASE_VERSION) info.os_version = sections.CHROMEOS_RELEASE_VERSION;
+  if (sections.CHROMEOS_RELEASE_CHROME_MILESTONE) info.milestone = sections.CHROMEOS_RELEASE_CHROME_MILESTONE;
+  if (sections.CHROMEOS_RELEASE_TRACK) info.channel = sections.CHROMEOS_RELEASE_TRACK;
+  if (sections.CHROMEOS_RELEASE_BOARD) info.board = sections.CHROMEOS_RELEASE_BOARD;
+  if (sections.CHROMEOS_RELEASE_BUILDER_PATH) info.version = sections.CHROMEOS_RELEASE_BUILDER_PATH;
+
+  // Wi-Fi chipset: find the Network Controller line in lspci
+  if (info.lspci) {
+    const wifiLine = info.lspci.find(l => /network controller|wireless|wi-?fi/i.test(l));
+    if (wifiLine) {
+      info.wifiChipset = wifiLine.replace(/^[0-9a-f:.]+\s+/i, '').replace(/^[^:]+:\s*/, '').trim();
     }
   }
-  flushBuffer();
+
+  // Regex fallback for QP/HTML format where CHROMEOS fields appear as key=value
+  // (only fills fields not already populated from sections above)
+  if (!info.os_version) {
+    const m = text.match(/CHROMEOS_RELEASE_VERSION=(?:3D)?([\d.]+)/);
+    if (m) info.os_version = m[1];
+  }
+  if (!info.milestone) {
+    const m = text.match(/CHROMEOS_RELEASE_CHROME_MILESTONE=(?:3D)?(\d+)/);
+    if (m) info.milestone = m[1];
+  }
+  if (!info.channel) {
+    const m = text.match(/CHROMEOS_RELEASE_TRACK=(?:3D)?([^\s<&]+)/);
+    if (m) info.channel = m[1];
+  }
+  if (!info.board) {
+    const m = text.match(/CHROMEOS_RELEASE_BOARD=(?:3D)?([^\s<&]+)/);
+    if (m) info.board = m[1];
+  }
+  if (!info.version) {
+    const m = text.match(/CHROMEOS_RELEASE_BUILDER_PATH=(?:3D)?([^\s<&]+)/);
+    if (m) info.version = m[1];
+  }
 
   return info;
 }

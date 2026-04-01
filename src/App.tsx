@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Wifi, 
   WifiOff, 
@@ -23,11 +23,13 @@ import {
   Globe,
   Lock,
   Keyboard,
-  X
+  X,
+  Upload,
+  FileText
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
-import { checkLatency, checkDNS, getChromebookInfo, parseCroshOutput, ParsedService, parseSystemInfo, SystemInfo } from './lib/diagnostics';
+import { checkLatency, checkDNS, getChromebookInfo, parseCroshOutput, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService } from './lib/diagnostics';
 
 // --- Types ---
 interface DiagnosticResult {
@@ -91,7 +93,9 @@ export default function App() {
   const [showAnalyzer, setShowAnalyzer] = useState(false);
   const [analyzerError, setAnalyzerError] = useState<string | null>(null);
   const [showSystemAnalyzer, setShowSystemAnalyzer] = useState(false);
-  const [systemInput, setSystemInput] = useState('');
+  const systemFileContentRef = useRef<string>('');
+  const systemFileInputRef = useRef<HTMLInputElement>(null);
+  const [systemFileName, setSystemFileName] = useState<string | null>(null);
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [systemError, setSystemError] = useState<string | null>(null);
 
@@ -137,17 +141,47 @@ export default function App() {
 
   const handleAnalyzeSystem = () => {
     setSystemError(null);
-    if (!systemInput.trim()) {
-      setSystemError("Please paste the output from chrome://system");
+    const rawText = systemFileContentRef.current;
+    if (!rawText.trim()) {
+      setSystemError("Please select a file first.");
       return;
     }
-    const result = parseSystemInfo(systemInput);
-    if (result.lspci || result.lsusb || result.version) {
+    const result = parseSystemInfo(rawText);
+    const hasData = result.lspci || result.lsusb || result.version || result.os_version
+      || result.networkDevice || result.networkService;
+
+    if (hasData) {
       setSystemInfo(result);
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: `I've analyzed your system information. I found details for your ${result.lspci ? 'PCI devices' : ''} ${result.lsusb ? 'and USB devices' : ''}. This helps me understand your hardware drivers better.` 
+
+      // Populate the main dashboard from network_services + network_devices
+      // if no crosh data has been loaded yet (or as a richer replacement)
+      if (result.networkService) {
+        const ps = networkServiceToParsedService(result.networkService, result.networkDevice);
+        setParsedService(ps);
+        setDiagnostics(prev => prev.map(d => {
+          if (d.id === 'signal' && result.networkService?.strength != null)
+            return { ...d, status: 'success', value: `${result.networkService!.strength}%` };
+          if (d.id === 'ip_res' && ps.ip)
+            return { ...d, status: 'success', value: ps.ip };
+          return d;
+        }));
+      }
+
+      const ns = result.networkService;
+      const nd = result.networkDevice;
+      const parts: string[] = [];
+      if (result.wifiChipset) parts.push(`**Chipset:** ${result.wifiChipset}`);
+      if (ns?.ssid) parts.push(`**Network:** ${ns.ssid} (${ns.band ?? ''} Ch.${ns.channel ?? ''})`);
+      if (nd?.linkStats?.receiveBitrate) parts.push(`**Link:** ${nd.linkStats.receiveBitrate}`);
+      if (ns?.disconnectCount !== undefined) parts.push(`**Disconnects:** ${ns.disconnectCount}`);
+
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: parts.length > 0
+          ? `I've analyzed your system info.\n${parts.join(' · ')}`
+          : `I've analyzed your system information. I found details for your ${result.lspci ? 'PCI devices' : ''} ${result.lsusb ? 'and USB devices' : ''}. This helps me understand your hardware drivers better.`
       }]);
+      setShowSystemAnalyzer(false);
     } else {
       setSystemError("Could not find any recognizable system information. Please ensure you copied the content from 'chrome://system'.");
     }
@@ -867,20 +901,17 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 h-full">
                   <div className="space-y-4 flex flex-col">
                     <div className="flex justify-between items-center">
-                      <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">1. Paste System Output</div>
+                      <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">1. Load System Output</div>
                       <div className="flex gap-2">
-                        <button 
-                          onClick={() => {
-                            navigator.clipboard.writeText('chrome://system');
-                            // Simple visual feedback could be added here if needed
-                          }}
+                        <button
+                          onClick={() => navigator.clipboard.writeText('chrome://system')}
                           className="text-[10px] font-bold text-[#4285F4] hover:bg-blue-50 px-3 py-1.5 rounded-full transition-colors uppercase tracking-widest flex items-center gap-1"
                           title="Copy URL to clipboard"
                         >
                           <Copy className="w-3 h-3" />
                           Copy URL
                         </button>
-                        <button 
+                        <button
                           onClick={() => window.open('chrome://system', '_blank')}
                           className="text-[10px] font-bold text-[#4285F4] hover:bg-blue-50 px-3 py-1.5 rounded-full transition-colors uppercase tracking-widest flex items-center gap-1"
                         >
@@ -889,29 +920,97 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                         </button>
                       </div>
                     </div>
-                    <div className="p-3 bg-blue-50 border border-blue-100 rounded-xl text-[11px] text-[#202124] leading-relaxed">
-                      <span className="font-bold text-[#4285F4]">Note:</span> For security, browsers often block opening <code className="bg-white px-1 rounded border border-blue-200">chrome://</code> URLs automatically. If the button fails, please <span className="font-bold">copy the URL</span> and paste it into a new tab manually.
+
+                    {/* How-to steps */}
+                    <div className="p-3 bg-blue-50 border border-blue-100 rounded-xl text-[11px] text-[#202124] leading-relaxed space-y-1">
+                      <p><span className="font-bold text-[#4285F4]">How to save the file:</span></p>
+                      <ol className="list-decimal list-inside space-y-1 text-[#5F6368]">
+                        <li>Open <code className="bg-white px-1 rounded border border-blue-200">chrome://system</code> in a new tab</li>
+                        <li>Click <span className="font-medium text-[#202124]">Expand All</span> to reveal all fields</li>
+                        <li>Press <kbd className="bg-white border border-blue-200 rounded px-1">Ctrl+S</kbd> to save the page as a file</li>
+                        <li>Upload that file below</li>
+                      </ol>
                     </div>
-                    <div className="relative group flex-1">
-                      <textarea 
-                        value={systemInput}
-                        onChange={(e) => {
-                          setSystemInput(e.target.value);
-                          setSystemError(null);
-                        }}
-                        placeholder="Copy everything from chrome://system and paste here..."
-                        className={`w-full h-full min-h-[300px] bg-gray-50 border-2 ${systemError ? 'border-red-200' : 'border-gray-100'} p-4 font-mono text-xs focus:outline-none focus:border-[#4285F4] focus:bg-white rounded-2xl transition-all resize-none`}
-                      />
-                    </div>
+
+                    {/* Hidden file input */}
+                    <input
+                      ref={systemFileInputRef}
+                      type="file"
+                      accept=".html,.htm,.md,.txt"
+                      className="hidden"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setSystemFileName(file.name);
+                        setSystemError(null);
+                        systemFileContentRef.current = '';
+                        const reader = new FileReader();
+                        reader.onload = (ev) => {
+                          systemFileContentRef.current = (ev.target?.result as string) ?? '';
+                        };
+                        reader.readAsText(file);
+                      }}
+                    />
+
+                    {/* Upload drop zone */}
+                    <button
+                      type="button"
+                      onClick={() => systemFileInputRef.current?.click()}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const file = e.dataTransfer.files?.[0];
+                        if (!file) return;
+                        setSystemFileName(file.name);
+                        setSystemError(null);
+                        systemFileContentRef.current = '';
+                        const reader = new FileReader();
+                        reader.onload = (ev) => {
+                          systemFileContentRef.current = (ev.target?.result as string) ?? '';
+                        };
+                        reader.readAsText(file);
+                      }}
+                      className={`flex-1 min-h-[220px] w-full flex flex-col items-center justify-center gap-4 rounded-2xl border-2 border-dashed transition-colors cursor-pointer
+                        ${systemFileName
+                          ? 'border-[#4285F4] bg-blue-50/50'
+                          : systemError
+                          ? 'border-red-300 bg-red-50/30'
+                          : 'border-gray-200 bg-gray-50 hover:border-[#4285F4] hover:bg-blue-50/30'
+                        }`}
+                    >
+                      {systemFileName ? (
+                        <>
+                          <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
+                            <FileText className="w-6 h-6 text-[#4285F4]" />
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm font-medium text-[#202124]">{systemFileName}</div>
+                            <div className="text-xs text-[#4285F4] mt-1">Click to replace</div>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center">
+                            <Upload className="w-6 h-6 text-gray-400" />
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm font-medium text-[#202124]">Click to upload or drag & drop</div>
+                            <div className="text-xs text-[#5F6368] mt-1">.html · .md · .txt</div>
+                          </div>
+                        </>
+                      )}
+                    </button>
+
                     {systemError && (
                       <div className="text-xs text-red-600 font-medium flex items-center gap-2 bg-red-50 p-3 rounded-xl border border-red-100">
                         <AlertCircle className="w-4 h-4" />
                         {systemError}
                       </div>
                     )}
-                    <button 
+                    <button
                       onClick={handleAnalyzeSystem}
-                      className="w-full py-4 bg-[#4285F4] text-white rounded-2xl text-sm font-medium shadow-lg shadow-blue-200 hover:bg-blue-600 transition-all active:scale-[0.98]"
+                      disabled={!systemFileName}
+                      className="w-full py-4 bg-[#4285F4] text-white rounded-2xl text-sm font-medium shadow-lg shadow-blue-200 hover:bg-blue-600 transition-all active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
                     >
                       Analyze System Info
                     </button>
@@ -931,7 +1030,190 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                             <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">OS Version</div>
                             <div className="text-xs font-medium text-[#202124] truncate">{systemInfo.os_version || 'Unknown'}</div>
                           </div>
+                          {systemInfo.milestone && (
+                            <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                              <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">Milestone</div>
+                              <div className="text-xs font-medium text-[#202124]">M{systemInfo.milestone}</div>
+                            </div>
+                          )}
+                          {systemInfo.channel && (
+                            <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                              <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">Channel</div>
+                              <div className="text-xs font-medium text-[#202124] capitalize">{systemInfo.channel.replace('-channel', '')}</div>
+                            </div>
+                          )}
                         </div>
+
+                        {/* Wi-Fi Chipset */}
+                        {systemInfo.wifiChipset && (
+                          <div className="p-4 bg-blue-50 border border-blue-100 rounded-2xl flex items-center gap-3">
+                            <Wifi className="w-5 h-5 text-[#4285F4] shrink-0" />
+                            <div>
+                              <div className="text-[9px] font-bold text-[#4285F4] uppercase tracking-widest mb-0.5">Wi-Fi Adapter</div>
+                              <div className="text-sm font-medium text-[#202124]">{systemInfo.wifiChipset}</div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Network Intelligence — Active Service */}
+                        {systemInfo.networkService && (
+                          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm">
+                            <div className="p-4 bg-gray-50 border-b border-gray-200 flex items-center gap-2">
+                              <Activity className="w-4 h-4 text-[#4285F4]" />
+                              <span className="text-[10px] font-bold text-[#202124] uppercase tracking-widest">Active Connection</span>
+                              {systemInfo.networkService.isConnected && (
+                                <span className="ml-auto flex items-center gap-1 text-[9px] font-bold text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block" />
+                                  CONNECTED
+                                </span>
+                              )}
+                            </div>
+                            <div className="p-4 grid grid-cols-2 gap-x-6 gap-y-4">
+                              {systemInfo.networkService.ssid && (
+                                <div className="col-span-2">
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">SSID</div>
+                                  <div className="text-base font-medium text-[#202124]">{systemInfo.networkService.ssid}</div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.bssid && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">BSSID (AP MAC)</div>
+                                  <div className="text-xs font-mono text-[#202124]">{systemInfo.networkService.bssid}</div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.security && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Security</div>
+                                  <div className="text-xs font-medium text-[#202124] flex items-center gap-1">
+                                    <Lock className="w-3 h-3 text-[#5F6368]" />
+                                    {systemInfo.networkService.security.toUpperCase()}
+                                  </div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.band && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Band</div>
+                                  <div className="text-xs font-medium text-[#202124]">{systemInfo.networkService.band}</div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.channel != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Channel</div>
+                                  <div className="text-xs font-medium text-[#202124]">
+                                    {systemInfo.networkService.channel}
+                                    {systemInfo.networkService.frequency ? ` (${systemInfo.networkService.frequency} MHz)` : ''}
+                                  </div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.phyMode != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">PHY Mode</div>
+                                  <div className="text-xs font-medium text-[#202124]">
+                                    {PHY_MODE_LABELS[systemInfo.networkService.phyMode] ?? `Mode ${systemInfo.networkService.phyMode}`}
+                                  </div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.ipv4Address && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">IP Address</div>
+                                  <div className="text-xs font-mono text-[#202124] bg-gray-50 px-2 py-1 rounded border border-gray-100 inline-block">
+                                    {systemInfo.networkService.ipv4Address}
+                                  </div>
+                                </div>
+                              )}
+                              {systemInfo.networkService.country && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Country</div>
+                                  <div className="text-xs font-medium text-[#202124]">{systemInfo.networkService.country}</div>
+                                </div>
+                              )}
+                              {(systemInfo.networkService.downlinkMbps != null || systemInfo.networkService.uplinkMbps != null) && (
+                                <div className="col-span-2 pt-2 border-t border-gray-100 grid grid-cols-2 gap-4">
+                                  <div>
+                                    <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Downlink Speed</div>
+                                    <div className="text-sm font-mono font-medium text-green-600">{systemInfo.networkService.downlinkMbps} Mbps</div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Uplink Speed</div>
+                                    <div className="text-sm font-mono font-medium text-blue-600">{systemInfo.networkService.uplinkMbps} Mbps</div>
+                                  </div>
+                                </div>
+                              )}
+                              {(systemInfo.networkService.disconnectCount != null || systemInfo.networkService.misconnectCount != null) && (
+                                <div className="col-span-2 pt-2 border-t border-gray-100 grid grid-cols-2 gap-4">
+                                  <div>
+                                    <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Disconnects</div>
+                                    <div className={`text-sm font-mono font-medium ${systemInfo.networkService.disconnectCount! > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                                      {systemInfo.networkService.disconnectCount}
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Misconnects</div>
+                                    <div className={`text-sm font-mono font-medium ${systemInfo.networkService.misconnectCount! > 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                                      {systemInfo.networkService.misconnectCount}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Link Statistics from network_devices */}
+                        {systemInfo.networkDevice?.linkStats && (
+                          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm">
+                            <div className="p-4 bg-gray-50 border-b border-gray-200 flex items-center gap-2">
+                              <Activity className="w-4 h-4 text-[#34A853]" />
+                              <span className="text-[10px] font-bold text-[#202124] uppercase tracking-widest">Link Statistics</span>
+                            </div>
+                            <div className="p-4 grid grid-cols-2 gap-x-6 gap-y-4">
+                              {systemInfo.networkDevice.linkStats.receiveBitrate && (
+                                <div className="col-span-2">
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Negotiated Bitrate</div>
+                                  <div className="text-xs font-mono text-[#202124]">{systemInfo.networkDevice.linkStats.receiveBitrate}</div>
+                                </div>
+                              )}
+                              {systemInfo.networkDevice.linkStats.avgSignalDbm != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Avg Signal</div>
+                                  <div className="text-sm font-mono font-medium text-[#202124]">{systemInfo.networkDevice.linkStats.avgSignalDbm} dBm</div>
+                                </div>
+                              )}
+                              {systemInfo.networkDevice.linkStats.lastSignalDbm != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Last Signal</div>
+                                  <div className="text-sm font-mono font-medium text-[#202124]">{systemInfo.networkDevice.linkStats.lastSignalDbm} dBm</div>
+                                </div>
+                              )}
+                              {systemInfo.networkDevice.linkStats.transmitRetries != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">TX Retries</div>
+                                  <div className={`text-sm font-mono font-medium ${systemInfo.networkDevice.linkStats.transmitRetries > 1000 ? 'text-amber-600' : 'text-green-600'}`}>
+                                    {systemInfo.networkDevice.linkStats.transmitRetries.toLocaleString()}
+                                  </div>
+                                </div>
+                              )}
+                              {systemInfo.networkDevice.bgscanSignalThreshold != null && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest mb-0.5">Roam Threshold</div>
+                                  <div className="text-sm font-mono font-medium text-[#202124]">{systemInfo.networkDevice.bgscanSignalThreshold} dBm</div>
+                                </div>
+                              )}
+                              <div className="col-span-2 pt-2 border-t border-gray-100 flex gap-4 text-[10px] text-[#5F6368]">
+                                {systemInfo.networkDevice.wakeOnWiFiSupported != null && (
+                                  <span className={`px-2 py-1 rounded-full border ${systemInfo.networkDevice.wakeOnWiFiAllowed ? 'bg-green-50 border-green-200 text-green-700' : 'bg-gray-50 border-gray-200'}`}>
+                                    WakeOnWiFi: {systemInfo.networkDevice.wakeOnWiFiAllowed ? 'On' : 'Off'}
+                                  </span>
+                                )}
+                                {systemInfo.networkDevice.macRandomizationEnabled != null && (
+                                  <span className={`px-2 py-1 rounded-full border ${systemInfo.networkDevice.macRandomizationEnabled ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-gray-50 border-gray-200'}`}>
+                                    MAC Rand: {systemInfo.networkDevice.macRandomizationEnabled ? 'On' : 'Off'}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )}
 
                         {/* PCI Devices (lspci) */}
                         {systemInfo.lspci && (
