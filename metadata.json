@@ -1,0 +1,5 @@
+{
+  "name": "ChromeOS Wi-Fi Fixer",
+  "description": "AI-powered diagnostic tool for troubleshooting Chromebook connectivity issues.",
+  "requestFramePermissions": []
+}
