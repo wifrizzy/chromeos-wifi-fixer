@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
-import { checkLatency, checkDNS, getChromebookInfo, parseCroshOutput, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService } from './lib/diagnostics';
+import { checkLatency, checkDNS, getChromebookInfo, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService } from './lib/diagnostics';
 
 // --- Types ---
 interface DiagnosticResult {
@@ -88,10 +88,7 @@ export default function App() {
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
-  const [croshInput, setCroshInput] = useState('');
   const [parsedService, setParsedService] = useState<ParsedService | null>(null);
-  const [showAnalyzer, setShowAnalyzer] = useState(false);
-  const [analyzerError, setAnalyzerError] = useState<string | null>(null);
   const [showSystemAnalyzer, setShowSystemAnalyzer] = useState(false);
   const systemFileContentRef = useRef<string>('');
   const systemFileInputRef = useRef<HTMLInputElement>(null);
@@ -116,29 +113,6 @@ export default function App() {
   }, []);
 
   // --- Logic ---
-  const handleAnalyzeCrosh = () => {
-    setAnalyzerError(null);
-    const result = parseCroshOutput(croshInput);
-    if (result) {
-      setParsedService(result);
-      // Update signal and IP diagnostics
-      setDiagnostics(prev => prev.map(d => {
-        if (d.id === 'signal') return { ...d, status: 'success', value: `${result.strength}%` };
-        if (d.id === 'ip_res' && result.ip) return { ...d, status: 'success', value: result.ip };
-        return d;
-      }));
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: `I've analyzed your Crosh output. You are connected to **${result.name}** (${result.security}). ${result.eap ? `This is an enterprise network using ${result.eap.method}.` : 'This is a standard PSK network.'}` 
-      }]);
-      // Close the analyzer modal to show the main dashboard update
-      setShowAnalyzer(false);
-    } else {
-      setParsedService(null);
-      setAnalyzerError("Could not find an active (online/ready) network in that output. Please ensure you copied the full 'connectivity show services' output.");
-    }
-  };
-
   const handleAnalyzeSystem = () => {
     setSystemError(null);
     const rawText = systemFileContentRef.current;
@@ -187,33 +161,6 @@ export default function App() {
     }
   };
 
-  const useSampleData = () => {
-    const sample = `crosh> connectivity show services
-/service/2
-  AutoConnect: true
-  CheckPortal: auto
-  Connectable: true
-  Device: /device/wlan0
-  IsConnected: true
-  Name: HomeWi-Fi
-  NetworkConfig/1/IPv4Address: 10.0.0.9/24
-  Security: wpa2
-  SecurityClass: psk
-  State: online
-  Strength: 60
-  WiFi.SignalStrengthRssi: -46
-  WiFi.TransmitFailures: 0
-  WiFi.TransmitSuccesses: 1240
-  WiFi.RoamState: idle
-
-/service/32
-  Name: Neighbor-WiFi
-  State: idle
-  Strength: 35
-crosh>`;
-    setCroshInput(sample);
-    setAnalyzerError(null);
-  };
   const runDiagnostics = async () => {
     setIsScanning(true);
     
@@ -339,14 +286,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
             <Cpu className="w-4 h-4" />
             System Info
           </button>
-          <button 
-            onClick={() => setShowAnalyzer(true)}
-            className="px-4 py-2 text-[11px] font-medium uppercase tracking-wider text-[#5F6368] hover:bg-gray-100 rounded-md transition-colors flex items-center gap-2"
-          >
-            <Activity className="w-4 h-4" />
-            Analyze Crosh
-          </button>
-          <button 
+          <button
             onClick={() => setShowAIChat(true)}
             className="px-4 py-2 text-[11px] font-medium uppercase tracking-wider bg-[#4285F4] text-white hover:bg-[#1A73E8] rounded-md transition-colors flex items-center gap-2 shadow-sm"
           >
@@ -464,8 +404,12 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                             </div>
                           </div>
                           <div>
-                            <label className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest block mb-1">Frequency</label>
-                            <div className="text-sm font-medium text-[#202124]">---</div>
+                            <label className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest block mb-1">Band / Channel</label>
+                            <div className="text-sm font-medium text-[#202124]">
+                              {systemInfo?.networkService?.band
+                                ? `${systemInfo.networkService.band}${systemInfo.networkService.channel ? ` · Ch. ${systemInfo.networkService.channel}` : ''}`
+                                : '---'}
+                            </div>
                           </div>
                         </div>
                         <div>
@@ -505,6 +449,40 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                           </div>
                         </div>
                       </div>
+                      {/* PSK / EAP details — full-width row */}
+                      {(parsedService.psk || parsedService.eap) && (
+                        <div className="col-span-2">
+                          {parsedService.eap ? (
+                            <div className="p-4 bg-blue-50 border border-blue-100 rounded-2xl">
+                              <div className="text-[10px] font-bold text-[#4285F4] uppercase tracking-widest mb-3 flex items-center gap-2">
+                                <Lock className="w-3.5 h-3.5" />
+                                802.1X (EAP) Details
+                              </div>
+                              <div className="grid grid-cols-2 gap-4 text-xs">
+                                <div>
+                                  <span className="text-[#5F6368]">Method</span>
+                                  <div className="font-mono font-bold text-[#202124] mt-0.5">{parsedService.eap.method || '---'}</div>
+                                </div>
+                                <div>
+                                  <span className="text-[#5F6368]">Identity</span>
+                                  <div className="font-mono text-[#202124] mt-0.5">{parsedService.eap.identity || '---'}</div>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="p-4 bg-green-50 border border-green-100 rounded-2xl">
+                              <div className="text-[10px] font-bold text-[#34A853] uppercase tracking-widest mb-3 flex items-center gap-2">
+                                <Lock className="w-3.5 h-3.5" />
+                                PSK Details
+                              </div>
+                              <div className="text-xs">
+                                <span className="text-[#5F6368]">Key Management</span>
+                                <div className="font-mono font-bold text-[#202124] mt-0.5">{parsedService.psk?.key_mgmt || 'WPA-PSK'}</div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </>
                   ) : (
                     <div className="col-span-2 py-12 text-center space-y-4">
@@ -514,14 +492,14 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                       <div>
                         <h4 className="text-gray-900 font-medium">No Active Network Data</h4>
                         <p className="text-sm text-gray-500 max-w-xs mx-auto mt-1">
-                          Use the Crosh Analyzer to import real telemetry from your Chromebook for a detailed diagnostic view.
+                          Use System Info to import telemetry from your Chromebook.
                         </p>
                       </div>
-                      <button 
-                        onClick={() => setShowAnalyzer(true)}
+                      <button
+                        onClick={() => setShowSystemAnalyzer(true)}
                         className="px-6 py-2 bg-[#4285F4] text-white rounded-full text-sm font-medium hover:bg-[#1A73E8] transition-colors shadow-md"
                       >
-                        Open Crosh Analyzer
+                        Open System Info
                       </button>
                     </div>
                   )}
@@ -676,192 +654,6 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
         )}
       </AnimatePresence>
 
-      {/* Crosh Analyzer Modal */}
-      <AnimatePresence>
-        {showAnalyzer && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setShowAnalyzer(false)}
-              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            />
-            <motion.div 
-              initial={{ scale: 0.95, opacity: 0, y: 20 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.95, opacity: 0, y: 20 }}
-              className="relative bg-white w-full max-w-4xl rounded-3xl shadow-2xl overflow-hidden border border-gray-200"
-            >
-              <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-white">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 bg-blue-50 rounded-lg">
-                    <Activity className="w-6 h-6 text-[#4285F4]" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-medium text-[#202124]">Advanced Crosh Analyzer</h3>
-                    <p className="text-xs text-[#5F6368]">Interpret connectivity show services output</p>
-                  </div>
-                </div>
-                <button 
-                  onClick={() => setShowAnalyzer(false)}
-                  className="p-2 hover:bg-gray-100 rounded-full transition-colors"
-                >
-                  <X className="w-5 h-5 text-[#5F6368]" />
-                </button>
-              </div>
-              
-              <div className="p-8 grid grid-cols-1 lg:grid-cols-2 gap-8">
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">1. Paste Crosh Output</div>
-                    <button 
-                      onClick={useSampleData}
-                      className="text-[10px] font-bold text-[#4285F4] hover:bg-blue-50 px-3 py-1.5 rounded-full transition-colors uppercase tracking-widest"
-                    >
-                      Use Sample Data
-                    </button>
-                  </div>
-                  <div className="relative group">
-                    <textarea 
-                      value={croshInput}
-                      onChange={(e) => {
-                        setCroshInput(e.target.value);
-                        setAnalyzerError(null);
-                      }}
-                      placeholder="Paste output from 'connectivity show services' here..."
-                      className={`w-full h-[400px] bg-gray-50 border-2 ${analyzerError ? 'border-red-200' : 'border-gray-100'} p-4 font-mono text-xs focus:outline-none focus:border-[#4285F4] focus:bg-white rounded-2xl transition-all resize-none`}
-                    />
-                    <div className="absolute top-4 right-4 opacity-20 group-hover:opacity-40 transition-opacity">
-                      <Terminal className="w-5 h-5" />
-                    </div>
-                  </div>
-                  {analyzerError && (
-                    <div className="text-xs text-red-600 font-medium flex items-center gap-2 bg-red-50 p-3 rounded-xl border border-red-100">
-                      <AlertCircle className="w-4 h-4" />
-                      {analyzerError}
-                    </div>
-                  )}
-                  <button 
-                    onClick={handleAnalyzeCrosh}
-                    className="w-full py-4 bg-[#4285F4] text-white rounded-2xl text-sm font-medium shadow-lg shadow-blue-200 hover:bg-blue-600 transition-all active:scale-[0.98]"
-                  >
-                    Interpret Status
-                  </button>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">2. Interpreted Status</div>
-                  {parsedService ? (
-                    <div className="bg-gray-50 border border-gray-100 p-6 rounded-2xl space-y-6">
-                      <div className="flex justify-between items-center border-b border-gray-200 pb-4">
-                        <span className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">Active Network</span>
-                        <span className="text-lg font-medium text-[#202124]">{parsedService.name}</span>
-                      </div>
-                      
-                      <div className="grid grid-cols-2 gap-6">
-                        <div>
-                          <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">Security</div>
-                          <div className="text-sm font-medium text-[#202124] flex items-center gap-2">
-                            <Lock className="w-3.5 h-3.5 text-[#5F6368]" />
-                            {parsedService.security}
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">Strength</div>
-                          <div className="flex items-center gap-3">
-                            <div className="text-sm font-medium text-[#202124]">{parsedService.strength}%</div>
-                            <SignalStrength strength={parsedService.strength} />
-                          </div>
-                        </div>
-                        <div className="col-span-2">
-                          <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest mb-1">IP Address</div>
-                          <div className="text-sm font-mono text-[#202124] bg-white px-3 py-2 rounded-lg border border-gray-200 inline-block">
-                            {parsedService.ip || '---'}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Signal & Packet Health Section */}
-                      <div className="p-4 bg-white border border-gray-200 rounded-2xl shadow-sm">
-                        <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest mb-4 flex items-center gap-2">
-                          <Activity className="w-3.5 h-3.5 text-[#4285F4]" />
-                          Signal & Packet Health
-                        </div>
-                        <div className="grid grid-cols-2 gap-y-4 gap-x-6">
-                          <div>
-                            <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest opacity-60">Last Signal</div>
-                            <div className="text-sm font-mono font-medium text-[#202124]">{parsedService.lastSignal || '---'} dBm</div>
-                          </div>
-                          <div>
-                            <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest opacity-60">Avg Signal</div>
-                            <div className="text-sm font-mono font-medium text-[#202124]">{parsedService.avgSignal || '---'} dBm</div>
-                          </div>
-                          <div className="col-span-2 border-t border-gray-100 pt-4 flex justify-between items-center">
-                            <div>
-                              <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest opacity-60">TX Success</div>
-                              <div className="text-sm font-mono font-medium text-green-600">+{parsedService.txSuccesses || '0'}</div>
-                            </div>
-                            <div className="text-right">
-                              <div className="text-[9px] font-bold text-[#5F6368] uppercase tracking-widest opacity-60">TX Failures</div>
-                              <div className="text-sm font-mono font-medium text-red-600">-{parsedService.txFailures || '0'}</div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Conditional Security Info */}
-                      {parsedService.eap ? (
-                        <div className="p-4 bg-blue-50 border border-blue-100 rounded-2xl">
-                          <div className="text-[10px] font-bold text-[#4285F4] uppercase tracking-widest mb-3">802.1X (EAP) Details</div>
-                          <div className="space-y-2">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#5F6368]">Method:</span>
-                              <span className="font-mono font-bold text-[#202124]">{parsedService.eap.method}</span>
-                            </div>
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#5F6368]">Identity:</span>
-                              <span className="font-mono text-[#202124]">{parsedService.eap.identity || '---'}</span>
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="p-4 bg-green-50 border border-green-100 rounded-2xl">
-                          <div className="text-[10px] font-bold text-[#34A853] uppercase tracking-widest mb-3">PSK Details</div>
-                          <div className="space-y-2">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#5F6368]">Key Management:</span>
-                              <span className="font-mono font-bold text-[#202124]">{parsedService.psk?.key_mgmt || 'WPA-PSK'}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      
-                      <div className="pt-2 flex items-center justify-between">
-                        <div className="text-[10px] font-bold text-[#5F6368] uppercase tracking-widest">Connection Status</div>
-                        <div className="flex items-center gap-2 bg-green-100 text-green-700 px-3 py-1 rounded-full">
-                          <div className="w-1.5 h-1.5 rounded-full bg-green-600 animate-pulse" />
-                          <span className="text-[10px] font-bold uppercase tracking-widest">{parsedService.state}</span>
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="h-[500px] bg-gray-50 border-2 border-dashed border-gray-200 rounded-2xl flex flex-col items-center justify-center text-center p-8">
-                      <div className="w-16 h-16 bg-white rounded-full shadow-sm flex items-center justify-center mb-4">
-                        <Terminal className="w-8 h-8 text-gray-300" />
-                      </div>
-                      <h4 className="text-[#202124] font-medium mb-2">No Active Network Data</h4>
-                      <p className="text-xs text-[#5F6368] max-w-[240px] leading-relaxed">
-                        Paste your Crosh output on the left to see an interpreted summary here.
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
       {/* System Info Analyzer Modal */}
       <AnimatePresence>
         {showSystemAnalyzer && (
