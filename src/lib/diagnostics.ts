@@ -494,3 +494,140 @@ export function parseSystemInfo(text: string): SystemInfo {
 
   return info;
 }
+
+// ---------------------------------------------------------------------------
+// chrome://device-log parser
+// ---------------------------------------------------------------------------
+
+export type DeviceLogLevel = 'debug' | 'event' | 'user' | 'error';
+export type DeviceLogCategory = 'signal' | 'speed' | 'state' | 'slow' | 'error' | 'other';
+
+export interface DeviceLogEntry {
+  timestamp: string;    // "2026/04/01 17:54:49.102500"
+  displayTime: string;  // "17:54:49"
+  level: DeviceLogLevel;
+  source: string;       // "network_state_handler.cc:2234"
+  message: string;
+  category: DeviceLogCategory;
+  rssi?: number;
+  strength?: number;
+  speedKbps?: number;
+  speedDir?: 'up' | 'down';
+}
+
+/** Format a raw log message into a compact, human-readable string. */
+export function formatDeviceLogMessage(entry: DeviceLogEntry): string {
+  const msg = entry.message;
+
+  // Property update: "DefaultNetworkPropertyUpdated: wifi_psk_0, Foo = Bar"
+  const propM = msg.match(/DefaultNetworkPropertyUpdated:\s*\S+,\s*(.+)$/);
+  if (propM) {
+    const prop = propM[1].trim();
+    // RSSI
+    const rssiM = prop.match(/WiFi\.SignalStrengthRssi\s*=\s*(-?\d+)/);
+    if (rssiM) return `RSSI: ${rssiM[1]} dBm`;
+    // Strength
+    const strM = prop.match(/^Strength\s*=\s*(\d+)/);
+    if (strM) return `Signal Strength: ${strM[1]}%`;
+    // Uplink speed
+    const upM = prop.match(/UplinkSpeedKbps\s*=\s*(\d+)/);
+    if (upM) return `↑ Uplink: ${(parseInt(upM[1]) / 1000).toFixed(1)} Mbps`;
+    // Downlink speed
+    const dnM = prop.match(/DownlinkSpeedKbps\s*=\s*(\d+)/);
+    if (dnM) return `↓ Downlink: ${(parseInt(dnM[1]) / 1000).toFixed(1)} Mbps`;
+    return prop;
+  }
+
+  // Slow method: "@@@ Slow method: .../FileName.cc:MethodName: Nms"
+  const slowM = msg.match(/@@@\s*Slow method:\s*.*\/([^/]+\.cc:\w+):\s*(\d+ms)/);
+  if (slowM) return `Slow: ${slowM[1]} (${slowM[2]})`;
+
+  // ActiveNetworksChanged
+  if (msg.includes('ActiveNetworksChanged')) return 'Active Networks Changed';
+
+  return msg;
+}
+
+export function parseDeviceLog(raw: string): DeviceLogEntry[] {
+  // Decode quoted-printable (handles =XX sequences and soft line breaks)
+  const decoded = raw
+    .replace(/=\r?\n/g, '')
+    .replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+
+  const entries: DeviceLogEntry[] = [];
+  const pRe = /<p>([\s\S]*?)<\/p>/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = pRe.exec(decoded)) !== null) {
+    const block = m[1];
+
+    // Extract log level from CSS class
+    const levelM = block.match(/log-level-(\w+)/);
+    if (!levelM) continue;
+    const level = levelM[1].toLowerCase() as DeviceLogLevel;
+
+    // Strip HTML comments and tags → plain text, collapse whitespace
+    const text = block
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Extract timestamp
+    const tsM = text.match(/\[(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]/);
+    if (!tsM) continue;
+    const timestamp = tsM[1];
+    const displayTime = timestamp.split(' ')[1]?.slice(0, 8) ?? timestamp;
+
+    // Split remainder into source (file:line) and message
+    const rest = text.slice(text.indexOf(tsM[0]) + tsM[0].length).trim();
+    const parts = rest.split(/\s+/);
+    const source = parts[0] ?? '';
+    const message = parts.slice(1).join(' ').trim();
+    if (!message) continue;
+
+    // Skip high-noise entries that add no diagnostic value
+    if (message.startsWith('GetShillProperties:')) continue;
+    if (message.startsWith('NOTIFY: NetworkPropertiesUpdated:')) continue;
+    if (message.includes('Host networks are considered equivalent to ARC')) continue;
+    // DefaultNetworkChanged is always paired with a more specific DefaultNetworkPropertyUpdated
+    if (message.startsWith('NOTIFY: DefaultNetworkChanged:')) continue;
+
+    // Categorize and extract typed values
+    let category: DeviceLogCategory = 'other';
+    let rssi: number | undefined;
+    let strength: number | undefined;
+    let speedKbps: number | undefined;
+    let speedDir: 'up' | 'down' | undefined;
+
+    if (level === 'error') {
+      category = 'error';
+    } else if (message.includes('@@@ Slow method')) {
+      category = 'slow';
+    } else if (message.includes('SignalStrengthRssi') || /,\s*Strength\s*=/.test(message)) {
+      category = 'signal';
+      const rssiM = message.match(/SignalStrengthRssi\s*=\s*(-?\d+)/);
+      if (rssiM) rssi = parseInt(rssiM[1]);
+      const strM = message.match(/,\s*Strength\s*=\s*(\d+)/);
+      if (strM) strength = parseInt(strM[1]);
+    } else if (message.includes('SpeedKbps')) {
+      category = 'speed';
+      const upM = message.match(/UplinkSpeedKbps\s*=\s*(\d+)/);
+      const dnM = message.match(/DownlinkSpeedKbps\s*=\s*(\d+)/);
+      if (upM) { speedKbps = parseInt(upM[1]); speedDir = 'up'; }
+      else if (dnM) { speedKbps = parseInt(dnM[1]); speedDir = 'down'; }
+    } else if (
+      message.includes('ActiveNetworksChanged') ||
+      message.includes('Connected') ||
+      message.includes('Disconnect') ||
+      message.includes('State =')
+    ) {
+      category = 'state';
+    }
+
+    entries.push({ timestamp, displayTime, level, source, message, category, rssi, strength, speedKbps, speedDir });
+  }
+
+  // Reverse so oldest entries appear first (chronological order)
+  return entries.reverse();
+}
