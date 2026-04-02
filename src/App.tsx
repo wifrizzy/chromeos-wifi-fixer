@@ -1449,22 +1449,28 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
               </div>
 
               <div className="p-6 border-t border-gray-100 bg-white">
-                <form onSubmit={handleSendMessage} className="relative">
-                  <input
-                    type="text"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    placeholder="Ask a question or describe your issue..."
-                    className="w-full bg-gray-50 border border-gray-200 p-4 pr-16 rounded-2xl focus:outline-none focus:ring-2 focus:ring-[#4285F4]/20 transition-all text-sm"
-                  />
-                  <button
-                    type="submit"
-                    disabled={!input.trim() || isTyping}
-                    className="absolute right-2 top-2 bottom-2 px-6 bg-[#4285F4] text-white rounded-xl text-xs font-bold uppercase tracking-wider hover:bg-[#1A73E8] disabled:opacity-30 transition-all shadow-sm"
-                  >
-                    Send
-                  </button>
-                </form>
+                {import.meta.env.VITE_DISABLE_AI === 'true' ? (
+                  <p className="text-xs text-center text-[#5F6368] py-2">
+                    AI assistant is unavailable in the hosted version. Run the app locally to use this feature.
+                  </p>
+                ) : (
+                  <form onSubmit={handleSendMessage} className="relative">
+                    <input
+                      type="text"
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      placeholder="Ask a question or describe your issue..."
+                      className="w-full bg-gray-50 border border-gray-200 p-4 pr-16 rounded-2xl focus:outline-none focus:ring-2 focus:ring-[#4285F4]/20 transition-all text-sm"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!input.trim() || isTyping}
+                      className="absolute right-2 top-2 bottom-2 px-6 bg-[#4285F4] text-white rounded-xl text-xs font-bold uppercase tracking-wider hover:bg-[#1A73E8] disabled:opacity-30 transition-all shadow-sm"
+                    >
+                      Send
+                    </button>
+                  </form>
+                )}
               </div>
             </motion.div>
           </div>
