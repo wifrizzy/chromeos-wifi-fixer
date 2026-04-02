@@ -30,7 +30,6 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI } from "@google/genai";
 import { checkLatency, checkDNS, getChromebookInfo, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService, parseDeviceLog, formatDeviceLogMessage, DeviceLogEntry, DeviceLogCategory } from './lib/diagnostics';
 
 // --- Types ---
@@ -350,6 +349,24 @@ export default function App() {
     };
   }, []);
 
+  // --- File validation ---
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+  const VALID_TEXT_TYPES = ['text/plain', 'text/html', 'text/markdown', 'application/xhtml+xml', ''];
+  const VALID_EXTENSIONS = ['.html', '.htm', '.md', '.txt', '.mhtml'];
+
+  const validateFile = (file: File, setError: (msg: string) => void): boolean => {
+    if (file.size > MAX_FILE_SIZE) {
+      setError(`File exceeds 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).`);
+      return false;
+    }
+    const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    if (!VALID_EXTENSIONS.includes(ext)) {
+      setError(`Invalid file type "${ext}". Accepted: ${VALID_EXTENSIONS.join(', ')}`);
+      return false;
+    }
+    return true;
+  };
+
   // --- Logic ---
   const handleAnalyzeSystem = () => {
     setSystemError(null);
@@ -452,23 +469,24 @@ export default function App() {
     setIsTyping(true);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const model = "gemini-3-flash-preview";
-      
       const diagnosticContext = diagnostics.map(d => `${d.name}: ${d.value || d.status}`).join(', ');
       const deviceInfo = JSON.stringify(getChromebookInfo());
-      
-      const response = await ai.models.generateContent({
-        model,
-        contents: `The user is on a Chromebook. Current network diagnostics: ${diagnosticContext}. Device Info: ${deviceInfo}. User says: ${userMsg}`,
-        config: {
-          systemInstruction: "You are a Chromebook Wi-Fi troubleshooting expert. Provide concise, step-by-step advice. Mention Chromebook-specific features like 'crosh', 'ChromeOS settings', or 'hardware switches' if relevant. Keep it technical but accessible. If the user is offline, explain that your AI capabilities are limited but provide standard offline fixes.",
-        }
+
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMsg, diagnosticContext, deviceInfo }),
       });
 
-      setMessages(prev => [...prev, { role: 'assistant', content: response.text || "I'm having trouble analyzing that right now. Try checking your physical Wi-Fi switch." }]);
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        throw new Error(errBody?.error || `Server error (${res.status})`);
+      }
+
+      const data = await res.json();
+      setMessages(prev => [...prev, { role: 'assistant', content: data.reply || "I'm having trouble analyzing that right now. Try checking your physical Wi-Fi switch." }]);
     } catch (error) {
-      console.error(error);
+      console.error('Chat request failed:', error instanceof Error ? error.message : 'Unknown error');
       setMessages(prev => [...prev, { role: 'assistant', content: "I'm offline or unable to reach my brain. Please check your connection." }]);
     } finally {
       setIsTyping(false);
@@ -1024,6 +1042,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                       onChange={(e) => {
                         const file = e.target.files?.[0];
                         if (!file) return;
+                        if (!validateFile(file, setSystemError)) return;
                         setSystemFileName(file.name);
                         setSystemError(null);
                         systemFileContentRef.current = '';
@@ -1044,6 +1063,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                         e.preventDefault();
                         const file = e.dataTransfer.files?.[0];
                         if (!file) return;
+                        if (!validateFile(file, setSystemError)) return;
                         setSystemFileName(file.name);
                         setSystemError(null);
                         systemFileContentRef.current = '';
@@ -1497,6 +1517,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                     onChange={(e) => {
                       const file = e.target.files?.[0];
                       if (!file) return;
+                      if (!validateFile(file, setTimelineError)) return;
                       setTimelineFileName(file.name);
                       setTimelineError(null);
                       timelineFileContentRef.current = '';
@@ -1588,6 +1609,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                           e.preventDefault();
                           const file = e.dataTransfer.files?.[0];
                           if (!file) return;
+                          if (!validateFile(file, setTimelineError)) return;
                           setTimelineFileName(file.name);
                           setTimelineError(null);
                           timelineFileContentRef.current = '';

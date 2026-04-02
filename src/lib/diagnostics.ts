@@ -3,24 +3,36 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+const FETCH_TIMEOUT_MS = 8000;
+
 export async function checkLatency(): Promise<number | null> {
   const start = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    await fetch('https://www.google.com/generate_204', { mode: 'no-cors', cache: 'no-cache' });
+    await fetch('https://www.google.com/generate_204', {
+      mode: 'no-cors', cache: 'no-cache', signal: controller.signal,
+    });
     return Date.now() - start;
-  } catch (e) {
-    console.error('Latency check failed:', e);
+  } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
 export async function checkDNS(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const response = await fetch('https://dns.google/resolve?name=google.com', { mode: 'cors' });
+    const response = await fetch('https://dns.google/resolve?name=google.com', {
+      mode: 'cors', signal: controller.signal,
+    });
     return response.ok;
-  } catch (e) {
-    console.error('DNS check failed:', e);
+  } catch {
     return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
