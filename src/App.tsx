@@ -10,7 +10,6 @@ import {
   AlertCircle,
   CheckCircle2,
   Terminal,
-  MessageSquare,
   Info,
   ExternalLink,
   Copy,
@@ -39,11 +38,6 @@ interface DiagnosticResult {
   status: 'pending' | 'success' | 'error' | 'warning';
   value?: string;
   details?: string;
-}
-
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
 }
 
 // --- Components ---
@@ -82,7 +76,7 @@ const SignalChart = ({ entries, onPointClick }: {
   const rssiData = entries
     .map((e, originalIdx) => ({ ...e, originalIdx }))
     .filter((e): e is DeviceLogEntry & { rssi: number; originalIdx: number } =>
-      e.category === 'signal' && e.rssi !== undefined
+      e.category === 'signal' && e.rssi !== undefined && e.rssi >= -110
     );
 
   if (rssiData.length < 2) return null;
@@ -92,7 +86,9 @@ const SignalChart = ({ entries, onPointClick }: {
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
 
-  const Y_MIN = -90, Y_MAX = -20;
+  const dataMin = Math.min(...rssiData.map(e => e.rssi));
+  const Y_MIN = Math.min(-90, Math.floor(dataMin / 10) * 10 - 5);
+  const Y_MAX = -20;
   const toY = (v: number) => PAD.top + cH - ((v - Y_MIN) / (Y_MAX - Y_MIN)) * cH;
   const toX = (i: number) => PAD.left + (rssiData.length > 1 ? (i / (rssiData.length - 1)) * cW : cW / 2);
 
@@ -120,7 +116,8 @@ const SignalChart = ({ entries, onPointClick }: {
   ];
 
   const thresholds = [-50, -60, -70];
-  const yLabels    = [-30, -50, -70, -90];
+  const yLabels: number[] = [];
+  for (let v = -30; v >= Y_MIN; v -= 20) yLabels.push(v);
 
   const xTicks: number[] = [0];
   if (rssiData.length > 2) xTicks.push(Math.floor((rssiData.length - 1) / 2));
@@ -130,7 +127,7 @@ const SignalChart = ({ entries, onPointClick }: {
     { v: (-50 + Y_MAX) / 2, label: 'Excellent', color: '#1A7F3C' },
     { v: -55,                label: 'Good',       color: '#9A5C00' },
     { v: -65,                label: 'Fair',        color: '#B85C00' },
-    { v: -80,                label: 'Poor',        color: '#B91C1C' },
+    { v: (Y_MIN + (-70)) / 2, label: 'Poor',        color: '#B91C1C' },
   ];
 
   return (
@@ -309,12 +306,7 @@ export default function App() {
     { id: 'signal', name: 'Signal Strength', status: 'pending' },
   ]);
   const [isScanning, setIsScanning] = useState(false);
-  const [showAIChat, setShowAIChat] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: "Hello! I'm your Chromebook Wi-Fi assistant. I've detected your current network state. How can I help you troubleshoot today?" }
-  ]);
-  const [input, setInput] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
+  const [lastScanTime, setLastScanTime] = useState<Date | null>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [parsedService, setParsedService] = useState<ParsedService | null>(null);
   const [showSystemAnalyzer, setShowSystemAnalyzer] = useState(false);
@@ -404,12 +396,6 @@ export default function App() {
       if (nd?.linkStats?.receiveBitrate) parts.push(`**Link:** ${nd.linkStats.receiveBitrate}`);
       if (ns?.disconnectCount !== undefined) parts.push(`**Disconnects:** ${ns.disconnectCount}`);
 
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: parts.length > 0
-          ? `I've analyzed your system info.\n${parts.join(' · ')}`
-          : `I've analyzed your system information. I found details for your ${result.lspci ? 'PCI devices' : ''} ${result.lsusb ? 'and USB devices' : ''}. This helps me understand your hardware drivers better.`
-      }]);
       setShowSystemAnalyzer(false);
     } else {
       setSystemError("Could not find any recognizable system information. Please ensure you copied the content from 'chrome://system'.");
@@ -457,41 +443,9 @@ export default function App() {
     setDiagnostics([...steps]);
 
     setIsScanning(false);
+    setLastScanTime(new Date());
   };
 
-  const handleSendMessage = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if (!input.trim()) return;
-
-    const userMsg = input.trim();
-    setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
-    setInput('');
-    setIsTyping(true);
-
-    try {
-      const diagnosticContext = diagnostics.map(d => `${d.name}: ${d.value || d.status}`).join(', ');
-      const deviceInfo = JSON.stringify(getChromebookInfo());
-
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg, diagnosticContext, deviceInfo }),
-      });
-
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => null);
-        throw new Error(errBody?.error || `Server error (${res.status})`);
-      }
-
-      const data = await res.json();
-      setMessages(prev => [...prev, { role: 'assistant', content: data.reply || "I'm having trouble analyzing that right now. Try checking your physical Wi-Fi switch." }]);
-    } catch (error) {
-      console.error('Chat request failed:', error instanceof Error ? error.message : 'Unknown error');
-      setMessages(prev => [...prev, { role: 'assistant', content: "I'm offline or unable to reach my brain. Please check your connection." }]);
-    } finally {
-      setIsTyping(false);
-    }
-  };
 
   const handleChartPointClick = (originalIdx: number) => {
     // Make sure the entry is visible (reset any filter), then scroll to it and flash
@@ -575,13 +529,6 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
           >
             <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
             {isScanning ? 'Scanning…' : 'Re-scan'}
-          </button>
-          <button
-            onClick={() => setShowAIChat(true)}
-            className="px-4 py-2 text-[11px] font-medium uppercase tracking-wider bg-[#4285F4] text-white hover:bg-[#1A73E8] rounded-md transition-colors flex items-center gap-2 shadow-sm"
-          >
-            <MessageSquare className="w-4 h-4" />
-            AI Assistant
           </button>
           <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md border border-gray-200 text-[11px] font-medium ${isOnline ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
             <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-600 animate-pulse' : 'bg-red-600'}`} />
@@ -823,9 +770,15 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
           {/* Footer Branding */}
           <div className="p-6 border-t border-gray-200 bg-white flex justify-between items-center">
             <div className="flex items-center gap-4 text-xs font-medium text-[#5F6368] uppercase tracking-widest">
-              <span>Diagnostic Engine v2.4</span>
-              <span className="w-1 h-1 bg-gray-300 rounded-full" />
-              <span>Google ChromeOS Verified</span>
+              <span>Last scan: {lastScanTime ? lastScanTime.toLocaleTimeString() : '—'}</span>
+              {(systemFileName || timelineEntries.length > 0) && (
+                <>
+                  <span className="w-1 h-1 bg-gray-300 rounded-full" />
+                  {systemFileName && <span className="text-[#34A853]">System file loaded</span>}
+                  {systemFileName && timelineEntries.length > 0 && <span className="w-1 h-1 bg-gray-300 rounded-full" />}
+                  {timelineEntries.length > 0 && <span className="text-[#34A853]">Timeline loaded</span>}
+                </>
+              )}
             </div>
             <div className="flex items-center gap-3">
               <button
@@ -1028,8 +981,8 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                       <ol className="list-decimal list-inside space-y-1 text-[#5F6368]">
                         <li>Open <code className="bg-white px-1 rounded border border-blue-200">chrome://system</code> in a new tab</li>
                         <li>Click <span className="font-medium text-[#202124]">Expand All</span> to reveal all fields</li>
-                        <li>Press <kbd className="bg-white border border-blue-200 rounded px-1">Ctrl+S</kbd> to save the page as a file</li>
-                        <li>Upload that file below</li>
+                        <li>Press <kbd className="bg-white border border-blue-200 rounded px-1">Ctrl+S</kbd> to save the page — Chrome saves it as an <code className="bg-white px-1 rounded border border-blue-200">.mhtml</code> file</li>
+                        <li>Upload that <code className="bg-white px-1 rounded border border-blue-200">.mhtml</code> file below</li>
                       </ol>
                     </div>
 
@@ -1037,7 +990,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                     <input
                       ref={systemFileInputRef}
                       type="file"
-                      accept=".html,.htm,.md,.txt"
+                      accept=".html,.htm,.mhtml,.md,.txt"
                       className="hidden"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
@@ -1098,7 +1051,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                           </div>
                           <div className="text-center">
                             <div className="text-sm font-medium text-[#202124]">Click to upload or drag & drop</div>
-                            <div className="text-xs text-[#5F6368] mt-1">.html · .md · .txt</div>
+                            <div className="text-xs text-[#5F6368] mt-1">.mhtml · .html · .md · .txt</div>
                           </div>
                         </>
                       )}
@@ -1381,101 +1334,6 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
         )}
       </AnimatePresence>
 
-      {/* AI Assistant Modal */}
-      <AnimatePresence>
-        {showAIChat && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="bg-white w-full max-w-2xl h-[80vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden border border-gray-200"
-            >
-              <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-white">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 bg-blue-50 rounded-lg">
-                    <MessageSquare className="w-6 h-6 text-[#4285F4]" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-medium text-[#202124]">AI Troubleshooting Assistant</h3>
-                    <p className="text-xs text-[#5F6368]">Powered by Gemini 3.0 Flash</p>
-                  </div>
-                </div>
-                <button 
-                  onClick={() => setShowAIChat(false)}
-                  className="p-2 hover:bg-gray-100 rounded-full transition-colors"
-                >
-                  <X className="w-6 h-6 text-gray-400" />
-                </button>
-              </div>
-
-              <div className="flex-1 p-6 overflow-y-auto space-y-6 bg-gray-50/30">
-                <AnimatePresence initial={false}>
-                  {messages.map((msg, i) => (
-                    <motion.div
-                      key={i}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                    >
-                      <div className={`max-w-[85%] p-4 rounded-2xl ${
-                        msg.role === 'user' 
-                          ? 'bg-[#4285F4] text-white rounded-tr-none shadow-md' 
-                          : 'bg-white border border-gray-200 shadow-sm rounded-tl-none text-[#202124]'
-                      }`}>
-                        <div className={`text-[11px] uppercase tracking-widest mb-1 font-bold ${msg.role === 'user' ? 'text-blue-100' : 'text-gray-400'}`}>
-                          {msg.role === 'user' ? 'You' : 'Chromebook Specialist'}
-                        </div>
-                        <div className="text-sm leading-relaxed whitespace-pre-wrap">
-                          {msg.content}
-                        </div>
-                      </div>
-                    </motion.div>
-                  ))}
-                  {isTyping && (
-                    <motion.div
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="flex justify-start"
-                    >
-                      <div className="bg-white border border-gray-200 p-4 rounded-2xl rounded-tl-none flex gap-1 shadow-sm">
-                        <div className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" />
-                        <div className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce [animation-delay:0.2s]" />
-                        <div className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce [animation-delay:0.4s]" />
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-
-              <div className="p-6 border-t border-gray-100 bg-white">
-                {import.meta.env.VITE_DISABLE_AI === 'true' ? (
-                  <p className="text-xs text-center text-[#5F6368] py-2">
-                    AI assistant is unavailable in the hosted version. Run the app locally to use this feature.
-                  </p>
-                ) : (
-                  <form onSubmit={handleSendMessage} className="relative">
-                    <input
-                      type="text"
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      placeholder="Ask a question or describe your issue..."
-                      className="w-full bg-gray-50 border border-gray-200 p-4 pr-16 rounded-2xl focus:outline-none focus:ring-2 focus:ring-[#4285F4]/20 transition-all text-sm"
-                    />
-                    <button
-                      type="submit"
-                      disabled={!input.trim() || isTyping}
-                      className="absolute right-2 top-2 bottom-2 px-6 bg-[#4285F4] text-white rounded-xl text-xs font-bold uppercase tracking-wider hover:bg-[#1A73E8] disabled:opacity-30 transition-all shadow-sm"
-                    >
-                      Send
-                    </button>
-                  </form>
-                )}
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
 
       {/* Connection Timeline Modal */}
       <AnimatePresence>
