@@ -585,17 +585,33 @@ export function parseDeviceLog(raw: string): DeviceLogEntry[] {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Extract timestamp
-    const tsM = text.match(/\[(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]/);
-    if (!tsM) continue;
-    const timestamp = tsM[1];
-    const displayTime = timestamp.split(' ')[1]?.slice(0, 8) ?? timestamp;
+    // Extract timestamp — supports both full format [YYYY/MM/DD HH:MM:SS.micros]
+    // and short format [HH:MM:SS] (newer ChromeOS versions)
+    const tsFullM = text.match(/\[(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]/);
+    const tsShortM = text.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+    if (!tsFullM && !tsShortM) continue;
+
+    const timestamp = tsFullM ? tsFullM[1] : `2026/04/03 ${tsShortM![1]}.000000`;
+    const displayTime = (tsFullM ? tsFullM[1] : tsShortM![1]).split(' ')[0]?.slice(0, 8) ?? timestamp;
 
     // Split remainder into source (file:line) and message
-    const rest = text.slice(text.indexOf(tsM[0]) + tsM[0].length).trim();
-    const parts = rest.split(/\s+/);
-    const source = parts[0] ?? '';
-    const message = parts.slice(1).join(' ').trim();
+    const tsMarker = tsFullM ? tsFullM[0] : tsShortM![0];
+    const rest = text.slice(text.indexOf(tsMarker) + tsMarker.length).trim();
+
+    let source: string;
+    let message: string;
+
+    if (tsFullM) {
+      // Full format: "[timestamp] source_file:line message"
+      const parts = rest.split(/\s+/);
+      source = parts[0] ?? '';
+      message = parts.slice(1).join(' ').trim();
+    } else {
+      // Short format: "[HH:MM:SS] message" (no source file)
+      source = '';
+      message = rest;
+    }
+
     if (!message) continue;
 
     // Skip high-noise entries that add no diagnostic value
