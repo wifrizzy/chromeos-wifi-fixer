@@ -525,6 +525,19 @@ export interface DeviceLogEntry {
   strength?: number;
   speedKbps?: number;
   speedDir?: 'up' | 'down';
+  bssid?: string;       // e.g. "e6:55:b8:ac:ac:b1"
+  frequency?: number;   // e.g. 5500 (MHz)
+}
+
+export interface RoamingSession {
+  bssid: string;
+  frequency: number | null;
+  band: '2.4GHz' | '5GHz' | '6GHz' | 'unknown';
+  startTimestamp: string;
+  endTimestamp: string;
+  startEntryIdx: number;
+  endEntryIdx: number;
+  durationMs: number;
 }
 
 /** Format a raw log message into a compact, human-readable string. */
@@ -558,6 +571,72 @@ export function formatDeviceLogMessage(entry: DeviceLogEntry): string {
   if (msg.includes('ActiveNetworksChanged')) return 'Active Networks Changed';
 
   return msg;
+}
+
+export function extractRoamingSessions(entries: DeviceLogEntry[]): RoamingSession[] {
+  function tsToMs(ts: string): number {
+    return new Date(ts.replace(/(\d{4})\/(\d{2})\/(\d{2})/, '$1-$2-$3')).getTime();
+  }
+
+  function bandFromFreq(freq: number | null): RoamingSession['band'] {
+    if (freq === null) return 'unknown';
+    if (freq < 3000) return '2.4GHz';
+    if (freq < 5925) return '5GHz';
+    return '6GHz';
+  }
+
+  const sessions: RoamingSession[] = [];
+  let currentBssid: string | null = null;
+  let currentFreq: number | null = null;
+  let sessionStartIdx = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+
+    if (entry.frequency !== undefined) {
+      currentFreq = entry.frequency;
+    }
+
+    if (entry.bssid !== undefined) {
+      if (currentBssid === null) {
+        currentBssid = entry.bssid;
+        sessionStartIdx = i;
+      } else if (entry.bssid !== currentBssid) {
+        const startTs = entries[sessionStartIdx].timestamp;
+        const endTs = entries[i - 1].timestamp;
+        sessions.push({
+          bssid: currentBssid,
+          frequency: currentFreq,
+          band: bandFromFreq(currentFreq),
+          startTimestamp: startTs,
+          endTimestamp: endTs,
+          startEntryIdx: sessionStartIdx,
+          endEntryIdx: i - 1,
+          durationMs: tsToMs(endTs) - tsToMs(startTs),
+        });
+        currentBssid = entry.bssid;
+        currentFreq = entry.frequency ?? currentFreq;
+        sessionStartIdx = i;
+      }
+    }
+  }
+
+  if (currentBssid !== null) {
+    const startTs = entries[sessionStartIdx].timestamp;
+    const endTs = entries[entries.length - 1].timestamp;
+    sessions.push({
+      bssid: currentBssid,
+      frequency: currentFreq,
+      band: bandFromFreq(currentFreq),
+      startTimestamp: startTs,
+      endTimestamp: endTs,
+      startEntryIdx: sessionStartIdx,
+      endEntryIdx: entries.length - 1,
+      durationMs: tsToMs(endTs) - tsToMs(startTs),
+    });
+  }
+
+  return sessions;
 }
 
 export function parseDeviceLog(raw: string): DeviceLogEntry[] {
@@ -627,6 +706,13 @@ export function parseDeviceLog(raw: string): DeviceLogEntry[] {
     let strength: number | undefined;
     let speedKbps: number | undefined;
     let speedDir: 'up' | 'down' | undefined;
+    let bssid: string | undefined;
+    let frequency: number | undefined;
+
+    const bssidM2 = message.match(/WiFi\.BSSID\s*=\s*"([0-9a-fA-F:]{17})"/);
+    if (bssidM2) bssid = bssidM2[1].toLowerCase();
+    const freqM2 = message.match(/WiFi\.Frequency\s*=\s*(\d+)/);
+    if (freqM2) frequency = parseInt(freqM2[1]);
 
     if (level === 'error') {
       category = 'error';
@@ -653,7 +739,7 @@ export function parseDeviceLog(raw: string): DeviceLogEntry[] {
       category = 'state';
     }
 
-    entries.push({ timestamp, displayTime, level, source, message, category, rssi, strength, speedKbps, speedDir });
+    entries.push({ timestamp, displayTime, level, source, message, category, rssi, strength, speedKbps, speedDir, bssid, frequency });
   }
 
   // Reverse so oldest entries appear first (chronological order)

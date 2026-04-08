@@ -29,7 +29,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { checkLatency, checkDNS, getChromebookInfo, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService, parseDeviceLog, formatDeviceLogMessage, DeviceLogEntry, DeviceLogCategory } from './lib/diagnostics';
+import { checkLatency, checkDNS, getChromebookInfo, ParsedService, parseSystemInfo, SystemInfo, PHY_MODE_LABELS, networkServiceToParsedService, parseDeviceLog, formatDeviceLogMessage, DeviceLogEntry, DeviceLogCategory, RoamingSession, extractRoamingSessions } from './lib/diagnostics';
 
 // --- Types ---
 interface DiagnosticResult {
@@ -81,7 +81,7 @@ const SignalChart = ({ entries, onPointClick }: {
 
   if (rssiData.length < 2) return null;
 
-  const W = 560, H = 210;
+  const W = 900, H = 210;
   const PAD = { top: 16, right: 88, bottom: 36, left: 56 };
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
@@ -155,7 +155,7 @@ const SignalChart = ({ entries, onPointClick }: {
       </div>
 
       {/* SVG */}
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: H }}>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ display: 'block' }}>
         <defs>
           <linearGradient id="rssiGrad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#7C3AED" stopOpacity="0.3" />
@@ -287,6 +287,226 @@ const SignalChart = ({ entries, onPointClick }: {
         <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-[#FBBC0528] border border-[#9A5C00]" /> −60 Good</div>
         <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-[#FF880028] border border-[#B85C00]" /> −70 Fair</div>
         <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-[#EA433528] border border-[#B91C1C]" /> Poor</div>
+      </div>
+    </div>
+  );
+};
+
+// --- Roaming Timeline Component ---
+const BAND_COLORS: Record<RoamingSession['band'], string> = {
+  '2.4GHz':  '#1A73E8',
+  '5GHz':    '#6D28D9',
+  '6GHz':    '#1E8E3E',
+  'unknown': '#9CA3AF',
+};
+const BAND_COLORS_LIGHT: Record<RoamingSession['band'], string> = {
+  '2.4GHz':  '#E8F0FE',
+  '5GHz':    '#EDE9FE',
+  '6GHz':    '#E6F4EA',
+  'unknown': '#F3F4F6',
+};
+
+const RoamingTimeline = ({
+  entries,
+  onSessionClick,
+}: {
+  entries: DeviceLogEntry[];
+  onSessionClick?: (startIdx: number, endIdx: number) => void;
+}) => {
+  const [activeIdx, setActiveIdx] = useState<number | null>(null);
+  const sessions = extractRoamingSessions(entries);
+  if (sessions.length < 2) return null;
+
+  // One lane per unique BSSID (first-seen order)
+  const uniqueBssids = Array.from(new Set(sessions.map(s => s.bssid)));
+
+  function tsToMs(ts: string) {
+    return new Date(ts.replace(/(\d{4})\/(\d{2})\/(\d{2})/, '$1-$2-$3')).getTime();
+  }
+
+  const logStart = tsToMs(sessions[0].startTimestamp);
+  const logEnd   = tsToMs(sessions[sessions.length - 1].endTimestamp);
+  const totalMs  = Math.max(1, logEnd - logStart);
+
+  const W         = 900;
+  const LABEL_W   = 84;
+  const PAD_RIGHT = 16;
+  const PAD_TOP   = 22;   // time axis
+  const ROW_H     = 32;
+  const BAR_H     = 10;
+  const DOT_R     = 4.5;
+  const chartW    = W - LABEL_W - PAD_RIGHT;
+  const H         = PAD_TOP + uniqueBssids.length * ROW_H + 10;
+
+  const toX   = (ts: string) => LABEL_W + ((tsToMs(ts) - logStart) / totalMs) * chartW;
+  const rowCy = (bssid: string) => PAD_TOP + uniqueBssids.indexOf(bssid) * ROW_H + ROW_H / 2;
+
+  // 5 evenly-spaced time ticks
+  const TICK_N = 4;
+  const ticks = Array.from({ length: TICK_N + 1 }, (_, i) => {
+    const d = new Date(logStart + (i / TICK_N) * totalMs);
+    const label = [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map(n => n.toString().padStart(2, '0')).join(':');
+    return { x: LABEL_W + (i / TICK_N) * chartW, label };
+  });
+
+  const abbrev    = (b: string) => b.slice(-8);
+  const roamCount = sessions.length - 1;
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm shrink-0">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-xs font-bold text-[#202124] uppercase tracking-widest flex items-center gap-2">
+          <Radio className="w-4 h-4 text-violet-600" />
+          Roaming Activities
+        </span>
+        <span className="text-[11px] px-2.5 py-1 rounded-full font-bold"
+          style={{ background: '#6D28D920', color: '#6D28D9' }}>
+          {roamCount} roam{roamCount !== 1 ? 's' : ''} detected
+        </span>
+      </div>
+
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ display: 'block' }}>
+        {/* Alternating row backgrounds */}
+        {uniqueBssids.map((_, i) => (
+          <rect key={i} x={0} y={PAD_TOP + i * ROW_H} width={W} height={ROW_H}
+            fill={i % 2 === 0 ? '#FAFAFA' : 'white'} />
+        ))}
+
+        {/* Vertical grid lines */}
+        {ticks.map((tick, i) => (
+          <line key={i} x1={tick.x} y1={PAD_TOP} x2={tick.x} y2={H}
+            stroke="#F3F4F6" strokeWidth="1" />
+        ))}
+
+        {/* AP row labels */}
+        {uniqueBssids.map((bssid) => {
+          const band  = sessions.find(s => s.bssid === bssid)?.band ?? 'unknown';
+          const color = BAND_COLORS[band];
+          const cy    = rowCy(bssid);
+          return (
+            <g key={bssid}>
+              <circle cx={9} cy={cy} r={4} fill={color} />
+              <text x={17} y={cy + 4} fontSize="10" fontWeight="600"
+                fill="#374151" fontFamily="'IBM Plex Mono', monospace">
+                {abbrev(bssid)}
+              </text>
+              {/* Faint guide line across chart area */}
+              <line x1={LABEL_W} y1={cy} x2={W - PAD_RIGHT} y2={cy}
+                stroke="#E5E7EB" strokeWidth="1" strokeDasharray="2,4" />
+            </g>
+          );
+        })}
+
+        {/* Connection bars — drawn first so dots sit on top */}
+        {sessions.map((session, i) => {
+          const x1    = toX(session.startTimestamp);
+          const x2    = Math.max(toX(session.endTimestamp), x1 + 4);
+          const cy    = rowCy(session.bssid);
+          const color = BAND_COLORS[session.band];
+          const light = BAND_COLORS_LIGHT[session.band];
+          const active = activeIdx === i;
+          const isLast = i === sessions.length - 1;
+          return (
+            <g key={i} style={{ cursor: 'pointer' }}
+              onClick={() => { setActiveIdx(active ? null : i); onSessionClick?.(session.startEntryIdx, session.endEntryIdx); }}>
+              {/* Wide invisible hit area */}
+              <rect x={x1} y={cy - 14} width={x2 - x1} height={28} fill="transparent" />
+              {/* Bar */}
+              <rect x={x1} y={cy - BAR_H / 2} width={x2 - x1} height={BAR_H} rx="3"
+                fill={active ? color : light} stroke={color}
+                strokeWidth={active ? 2 : 1.5} opacity={active ? 1 : 0.9} />
+              {/* Trailing dash for last (ongoing) session */}
+              {isLast && (
+                <line x1={x2} y1={cy} x2={W - PAD_RIGHT} y2={cy}
+                  stroke={color} strokeWidth="1.5" strokeDasharray="4,4" opacity="0.35" />
+              )}
+            </g>
+          );
+        })}
+
+        {/* Roam transition connectors + dots — drawn last so they're on top */}
+        {sessions.slice(0, -1).map((session, i) => {
+          const next  = sessions[i + 1];
+          const xDep  = toX(session.endTimestamp);
+          const xArr  = toX(next.startTimestamp);
+          const cyDep = rowCy(session.bssid);
+          const cyArr = rowCy(next.bssid);
+          const cDep  = BAND_COLORS[session.band];
+          const cArr  = BAND_COLORS[next.band];
+          const sameLane = cyDep === cyArr;
+          return (
+            <g key={`t-${i}`}>
+              {/* Connector line between departure and arrival dots */}
+              {!sameLane && (
+                <line x1={xDep} y1={cyDep} x2={xArr} y2={cyArr}
+                  stroke="#9CA3AF" strokeWidth="1.5" strokeDasharray="3,2" opacity="0.6" />
+              )}
+              {/* Departure: hollow dot */}
+              <circle cx={xDep} cy={cyDep} r={DOT_R}
+                fill="white" stroke={cDep} strokeWidth="2" />
+              {/* Arrival: filled dot */}
+              <circle cx={xArr} cy={cyArr} r={DOT_R}
+                fill={cArr} stroke="white" strokeWidth="1.5" />
+            </g>
+          );
+        })}
+
+        {/* Time axis */}
+        <line x1={LABEL_W} y1={PAD_TOP - 1} x2={W - PAD_RIGHT} y2={PAD_TOP - 1}
+          stroke="#E5E7EB" strokeWidth="1" />
+        {ticks.map((tick, i) => (
+          <g key={i}>
+            <line x1={tick.x} y1={PAD_TOP - 5} x2={tick.x} y2={PAD_TOP - 1}
+              stroke="#9CA3AF" strokeWidth="1" />
+            <text x={tick.x} y={PAD_TOP - 8} fontSize="9" fill="#6B7280" fontWeight="500"
+              textAnchor={i === 0 ? 'start' : i === TICK_N ? 'end' : 'middle'}>
+              {tick.label}
+            </text>
+          </g>
+        ))}
+      </svg>
+
+      {/* Active session detail pill */}
+      {activeIdx !== null && (() => {
+        const s     = sessions[activeIdx];
+        const secs  = Math.round(s.durationMs / 1000);
+        const color = BAND_COLORS[s.band];
+        const light = BAND_COLORS_LIGHT[s.band];
+        return (
+          <div className="mt-3 px-3 py-2 rounded-xl text-xs font-mono flex items-center gap-4 border flex-wrap"
+            style={{ background: light, borderColor: color + '40', color }}>
+            <span className="font-bold">{s.bssid}</span>
+            <span>{s.band}</span>
+            {s.frequency && <span>{s.frequency} MHz</span>}
+            <span>{secs}s on this AP</span>
+            <span className="opacity-70">
+              {s.startTimestamp.split(' ')[1]?.slice(0, 8)} → {s.endTimestamp.split(' ')[1]?.slice(0, 8)}
+            </span>
+          </div>
+        );
+      })()}
+
+      {/* Legend */}
+      <div className="flex items-center gap-5 mt-3 text-xs font-medium text-[#374151] flex-wrap">
+        {(['2.4GHz', '5GHz', '6GHz', 'unknown'] as const)
+          .filter(band => sessions.some(s => s.band === band))
+          .map(band => (
+            <div key={band} className="flex items-center gap-1.5">
+              <div className="w-3 h-3 rounded-sm border"
+                style={{ background: BAND_COLORS_LIGHT[band], borderColor: BAND_COLORS[band] }} />
+              {band}
+            </div>
+          ))}
+        <div className="flex items-center gap-1.5">
+          <svg width="26" height="10" style={{ overflow: 'visible' }}>
+            <circle cx="5" cy="5" r="4" fill="white" stroke="#9CA3AF" strokeWidth="2" />
+            <line x1="9" y1="5" x2="17" y2="5" stroke="#9CA3AF" strokeWidth="1.5" strokeDasharray="3,2" />
+            <circle cx="21" cy="5" r="4" fill="#9CA3AF" stroke="white" strokeWidth="1.5" />
+          </svg>
+          Roam transition
+        </div>
       </div>
     </div>
   );
@@ -456,6 +676,15 @@ export default function App() {
       entryRefs.current.get(originalIdx)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 60);
     // Clear highlight after 2s
+    setTimeout(() => setHighlightedEntry(null), 2000);
+  };
+
+  const handleRoamingSessionClick = (startIdx: number, _endIdx: number) => {
+    setTimelineFilter('all');
+    setHighlightedEntry(startIdx);
+    setTimeout(() => {
+      entryRefs.current.get(startIdx)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
     setTimeout(() => setHighlightedEntry(null), 2000);
   };
 
@@ -1517,7 +1746,7 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                 </div>
 
                 {/* Right panel: timeline */}
-                <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="flex-1 overflow-y-auto">
                   {timelineEntries.length > 0 ? (
                     <>
                       {/* Signal chart — shown when RSSI data is available */}
@@ -1527,8 +1756,13 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                         </div>
                       )}
 
-                      {/* Filter tabs */}
-                      <div className="px-6 pt-4 pb-3 border-b border-gray-100 flex gap-2 flex-wrap shrink-0">
+                      {/* Roaming timeline — shown when ≥2 distinct BSSIDs detected */}
+                      <div className="px-6 pt-4 shrink-0">
+                        <RoamingTimeline entries={timelineEntries} onSessionClick={handleRoamingSessionClick} />
+                      </div>
+
+                      {/* Filter tabs — sticky so they stay visible while scrolling events */}
+                      <div className="sticky top-0 z-10 bg-white px-6 pt-4 pb-3 border-b border-gray-100 flex gap-2 flex-wrap">
                         {([
                           { key: 'all', label: 'All', icon: null },
                           { key: 'state', label: 'State', icon: <Radio className="w-3 h-3" /> },
@@ -1561,8 +1795,8 @@ ${JSON.stringify(getChromebookInfo(), null, 2)}
                         })}
                       </div>
 
-                      {/* Scrollable timeline */}
-                      <div className="flex-1 overflow-y-auto p-6">
+                      {/* Timeline events */}
+                      <div className="p-6">
                         <div className="relative">
                           {/* Vertical line */}
                           <div className="absolute left-[5.5rem] top-0 bottom-0 w-px bg-gray-200" />
